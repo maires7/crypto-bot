@@ -1,0 +1,219 @@
+import requests
+import time
+import yfinance as yf
+import os
+from datetime import datetime
+import pytz
+
+# --- KEYS ---
+TELEGRAM_TOKEN = "8626941765:AAFr5eiRQABnaY8-C-Pe4EmpZhCFf_hu1c0"
+CHAT_ID = "6227906302"
+FINNHUB_KEY = "d6uh4hhr01qp1k9ch0c0d6uh4hhr01qp1k9ch0cg"
+
+# --- CRYPTO WATCHLIST ---
+WATCHLIST = [
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD",
+    "COIN",
+    "MSTR"
+]
+
+# --- FILES ---
+SEEN_FILE = "seen_crypto.txt"
+MACRO_FILE = "seen_macro_crypto.txt"
+
+# --- LOAD SEEN ---
+def load_seen(file):
+    if os.path.exists(file):
+        with open(file, "r") as f:
+            return set(f.read().splitlines())
+    return set()
+
+seen = load_seen(SEEN_FILE)
+seen_macro = load_seen(MACRO_FILE)
+
+# --- TELEGRAM ---
+def send_alert(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": CHAT_ID, "text": message})
+
+# --- TIME CHECK ---
+def is_premarket():
+    ny = pytz.timezone("US/Eastern")
+    now = datetime.now(ny)
+    return (4 <= now.hour < 9) or (now.hour == 9 and now.minute < 30)
+
+# --- API ---
+def finnhub_get(endpoint, params=None):
+    url = f"https://finnhub.io/api/v1/{endpoint}"
+    params = params or {}
+    params["token"] = FINNHUB_KEY
+
+    try:
+        res = requests.get(url, params=params, timeout=10)
+        if res.status_code != 200:
+            return None
+        return res.json()
+    except:
+        return None
+
+# --- CRYPTO MACRO NEWS ---
+def get_macro_news():
+    return finnhub_get("news", {"category": "crypto"}) or []
+
+# --- GET NEWS ---
+def get_news(ticker):
+    return finnhub_get("company-news", {
+        "symbol": ticker,
+        "from": "2025-01-01",
+        "to": "2026-12-31"
+    }) or []
+
+# --- SENTIMENT ---
+def get_sentiment(ticker):
+    data = finnhub_get("news-sentiment", {"symbol": ticker})
+    if not data:
+        return None
+
+    sentiment = data.get("sentiment", {})
+    bullish = sentiment.get("bullishPercent", 0)
+    bearish = sentiment.get("bearishPercent", 0)
+
+    return round(bullish - bearish, 2)
+
+# --- CLASSIFIER ---
+def classify_news(text):
+    text = text.lower()
+
+    if any(k in text for k in [
+        "etf", "approval", "regulation",
+        "ban", "lawsuit", "sec",
+        "hack", "exploit"
+    ]):
+        return "🚨 VERY IMPORTANT"
+
+    if any(k in text for k in [
+        "adoption", "growth", "partnership",
+        "upgrade", "launch", "bullish"
+    ]):
+        return "📈 POSITIVE"
+
+    if any(k in text for k in [
+        "crash", "decline", "bearish",
+        "liquidation", "sell-off"
+    ]):
+        return "📉 NEGATIVE"
+
+    return None
+
+# --- RELEVANCE ---
+def is_relevant(ticker, text):
+    text = text.lower()
+
+    keywords = {
+        "BTC-USD": ["bitcoin", "btc"],
+        "ETH-USD": ["ethereum", "eth"],
+        "SOL-USD": ["solana", "sol"],
+        "COIN": ["coinbase"],
+        "MSTR": ["microstrategy"]
+    }
+
+    if ticker in keywords:
+        return any(word in text for word in keywords[ticker])
+
+    return False
+
+# --- PRICE ---
+def get_price_change(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        data = stock.history(period="1d", interval="5m")
+        if len(data) > 0:
+            open_price = data["Open"][0]
+            current_price = data["Close"][-1]
+            return round(((current_price - open_price) / open_price) * 100, 2)
+    except:
+        return None
+
+# --- MAIN LOOP ---
+while True:
+    now = int(time.time())
+
+    # 🌍 CRYPTO MACRO NEWS
+    for article in get_macro_news():
+        aid = str(article.get("id", ""))
+        if not aid or aid in seen_macro:
+            continue
+
+        seen_macro.add(aid)
+        with open(MACRO_FILE, "a") as f:
+            f.write(aid + "\n")
+
+        headline = article.get("headline", "")
+        url = article.get("url", "")
+
+        tag = "🪙 PRE-MARKET CRYPTO" if is_premarket() else "🪙 CRYPTO NEWS"
+
+        send_alert(f"{tag}\n\n{headline}\n\n{url}")
+
+    time.sleep(2)
+
+    # 🎯 CRYPTO WATCHLIST
+    for ticker in WATCHLIST:
+        news_list = get_news(ticker)
+
+        for news in news_list:
+            nid = str(news.get("id", ""))
+            if not nid or nid in seen:
+                continue
+
+            news_time = news.get("datetime", 0)
+            if now - news_time > 21600:
+                continue
+
+            seen.add(nid)
+            with open(SEEN_FILE, "a") as f:
+                f.write(nid + "\n")
+
+            headline = news.get("headline", "")
+            summary = news.get("summary", "")
+            url = news.get("url", "")
+            text = headline + " " + summary
+
+            if not is_relevant(ticker, text):
+                continue
+
+            category = classify_news(text)
+            if not category:
+                continue
+
+            price = get_price_change(ticker)
+            sentiment = get_sentiment(ticker)
+
+            # --- SCORE ---
+            score = "C"
+            if sentiment and sentiment > 20:
+                score = "A+"
+            elif sentiment and sentiment > 5:
+                score = "B"
+
+            tag = "🚨 PRE-MARKET" if is_premarket() else category
+
+            message = f"""
+{tag}
+
+Ticker: {ticker}
+Move: {price}%
+Sentiment: {sentiment}
+Score: {score}
+
+{headline}
+
+{url}
+"""
+            send_alert(message)
+
+        time.sleep(1)
+
+    time.sleep(60)
